@@ -44,3 +44,30 @@ class MemoryBuffer:
 		if self.len > self.maxSize:
 			self.len = self.maxSize
 		self.buffer.append(transition)
+
+
+class StateBuffer:
+    
+	def __init__(self, size):
+		self.buffer = deque(maxlen=size)
+		self.maxSize = size
+		self.len = 0
+
+	def sample(self, count):
+		"""
+		samples a random batch from the replay memory buffer
+		:param count: batch size
+		:return: batch (numpy array)
+		"""
+		count = min(count, self.len)
+		batch = np.float32(random.sample(self.buffer, count))
+		return batch
+
+	def len(self):
+		return self.len
+
+	def add(self, states):
+		self.len += len(states)
+		if self.len > self.maxSize:
+			self.len = self.maxSize
+		self.buffer.extend(states)
