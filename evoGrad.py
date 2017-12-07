@@ -9,15 +9,15 @@ import torch.optim as optim
 import torch.nn.init as init
 import torch.multiprocessing as mp
 import copy
-import utils
+
 import time
 import random
 import numpy as np
-import buffer
 import gc
 import os
 import subprocess
 
+from collections import deque
 from torch.autograd import Variable
 from gym import wrappers
 from collections import namedtuple
@@ -45,13 +45,13 @@ MAX_EPISODES = 5000
 MAX_STEPS = 3000
 MAX_BUFFER = 1000000
 MAX_TOTAL_REWARD = 300
-POPULATION = 51
-WORKERS = 64
-SAMPLES = 16
+WORKERS = 65
+TRIAL = 4
+BESTS = 4
 BATCH_SIZE = 128
 INNER_STEP = 5
-SEED = 19920206
-SIGMA = 0.1
+SEED = 206
+SIGMA = 0.10
 gpu = -1
 
 def set_seed(seed):
@@ -62,7 +62,6 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 set_seed(SEED)
-
 class Seeder:
     def __init__(self, init_seed=0):
         np.random.seed(init_seed)
@@ -73,6 +72,33 @@ class Seeder:
     def next_batch(self, batch_size):
         result = np.random.randint(self.limit, size=batch_size).tolist()
         return result
+
+class StateBuffer:
+    
+	def __init__(self, size):
+		self.buffer = deque(maxlen=size)
+		self.maxSize = size
+		self.len = 0
+
+	def sample(self, count):
+		"""
+		samples a random batch from the replay memory buffer
+		:param count: batch size
+		:return: batch (numpy array)
+		"""
+		count = min(count, self.len)
+		batch = np.float32(random.sample(self.buffer, count))
+		return batch
+
+	def len(self):
+		return self.len
+
+	def add(self, states):
+		self.len += len(states)
+		if self.len > self.maxSize:
+			self.len = self.maxSize
+		self.buffer.extend(states)
+
 
 Game = namedtuple('Game', 
     ['env_name', 'time_factor', 'input_size', 'output_size', 'layers', 'activation', 'noise_bias', 'output_noise'])
@@ -168,18 +194,12 @@ class Agent(nn.Module):
             self.net.append(nn.Linear(input_size, size))
             input_size = size
         self.output = nn.Linear(input_size, game.output_size)
-    
-        # action noise
-        self.noise = utils.OrnsteinUhlenbeckActionNoise(game.output_size)
         self.env = None
 
-        # weight initialization --- try Gaussian initialization ?? ---
-        # for l in self.net:
-        #     init.xavier_normal(l.weight, gain=init.calculate_gain('relu'))
-        #     init.constant(l.bias, 0.0)
-        # init.xavier_normal(self.output.weight, gain=init.calculate_gain('tanh'))
-        # init.constant(self.output.bias, 0.0) 
-
+    def reset(self):
+        for l in self.net:
+            l.reset_parameters()
+        self.output.reset_parameters()
 
     def make_env(self, seed=-1, video_callable=False):
         if self.env is None:
@@ -220,7 +240,7 @@ class Simulator(object):
         self.agent = agent
         self.sgn = sgn
         self.optimizer = torch.optim.Adam(self.agent.parameters(), 0.001) 
-        self.optim_sgn = torch.optim.Adam(self.sgn.parameters(), 0.001) 
+        self.optim_sgn = torch.optim.Adam(self.sgn.parameters(), 0.002) 
 
         if self.gpu > -1:
             self.agent = agent.cuda(gpu)
@@ -241,12 +261,10 @@ class Simulator(object):
         fake_loss.backward()
         self.optimizer.step()
 
-    def simulate(self, episodes=1, seed=None, max_step=-1, train=True, noisy=False):
+    def simulate(self, episodes=1, seed=None, max_step=-1, train=True):
         steps, rewards, states = [], [], []
         agent = self.agent
-
         for ep in range(episodes):
-
             if seed is not None:            
                 set_seed(seed[ep])
 
@@ -277,13 +295,14 @@ class Simulator(object):
             rewards.append(total_reward)
             steps.append(step)
 
+        rewards = np.mean(rewards)
+        steps = np.mean(steps)
         return rewards, steps, states
 
 simulator = Simulator(
             Agent(games['bipedhard']), 
             SGN(SGNET(games['bipedhard'])),
             gpu=-1)
-
 
 
 # ------------------- EvoGrad --------------------------------------- #
@@ -297,10 +316,11 @@ def mutate(state_dict, population, sigma=0.1):
     return noise_states
 
 
-def evolve(agent_states, sgn_states, reward, sigma=0.1, k=1):
-    
+def evolve(agent_states, sgn_states, rewards, sigma=0.1):
+    # agent_states: WORKERS x BESTS
+    # sgn_states:   WORKERS
+    # rewards:      WORKERS x [BESTS]
     def compute_ranks(x):
-
         assert x.ndim == 1
         ranks = np.empty(x.size, dtype=int)
         ranks[x.argsort()] = np.arange(x.size)
@@ -315,96 +335,101 @@ def evolve(agent_states, sgn_states, reward, sigma=0.1, k=1):
         y -= .5
         return y
     
-    assert len(agent_states) % k == 0, 'k must be divided by the agent number'
+    # Agent Selection:
+    rewards = np.array(rewards, dtype=np.float32)  # BESTS x WORKERS
+    bestidx = np.argsort(rewards)[::-1][:BESTS]    # best index
+    new_agent_states = [agent_states[idx] for idx in bestidx]
+    logger.info('{} agents: Average Rewards: {:.3f}, Min: {:.3f}, Max: {}'.format(rewards.size, np.mean(rewards), 
+        np.min(rewards), ' '.join(['{:.3f}({})'.format(a, bestidx[it]) for it, a in enumerate(rewards[bestidx])])))
 
-    # reward shaping
-    logger.info('Rewards: {}, Max: {}, Min: {}'.format(np.mean(reward), np.max(reward), np.min(reward)))
-    reward  = np.array(reward, dtype=np.float32)
-    _reward = compute_centered_ranks(reward)
-    idx = np.argsort(_reward)[::-1]
-    best_idx = idx[:k]   # top K agents will be saved.
-    logger.info('Top K: {}'.format(reward[best_idx]))
+    # Reward reshaping
+    rewards = rewards.reshape(-1, BESTS)[:-1].mean(-1)  # (65-1) * 4
+    ranked_rewards = compute_centered_ranks(rewards)
+    normalized_reward = (ranked_rewards - np.mean(ranked_rewards)) / np.std(ranked_rewards)
+    weights = normalized_reward / (WORKERS-1) / (sigma * sigma)
 
-    # Agent selection
-    new_agents = []
-    for i in range(len(agent_states) // k):
-        for idx in best_idx:
-            new_agents.append(agent_states[idx])
-
-    # ES updates for SGN
-    normalized_reward = (reward - np.mean(reward)) / np.std(reward)
-    weights = normalized_reward / len(sgn_states) / (sigma * sigma)
-
+    # SGN updates (ES + Adam)
     simulator.optim_sgn.zero_grad()
     for name, p in simulator.sgn.named_parameters():
-        for i in range(len(sgn_states)):
+        for i in range(WORKERS-1):
             p.grad.data += weights[i] * (p.data - sgn_states[i][name])
     simulator.optim_sgn.step()
 
-    return new_agents
+    return new_agent_states
 
 
 def slave():
-    simulator.agent.make_env(19920206)
+    # make enviromnent
+    simulator.agent.make_env(SEED)
     while True:
-        _agent, _sgn, _batch, _seeds = comm.recv(source=0)
+        agent_states, sgn_state, batches, seeds = comm.recv(source=0)
+        rewards, steps, states = [], [], []
 
-        if _agent is not None:
-            simulator.agent.load_state_dict(_agent[0])
-            simulator.optimizer.load_state_dict(_agent[1])
+        if (len(batches) > 0) and (sgn_state is not None):   # load the sgn state
+            simulator.sgn.load_state_dict(sgn_state)
+
+        for it, agent_state in enumerate(agent_states):
+            if agent_state is not None:  # load agent state
+                simulator.agent.load_state_dict(agent_state[0])
+                simulator.optimizer.load_state_dict(agent_state[1])
+
+            # local updates of agents with synthetic gradients.
+            if len(batches) > 0:
+                for batch in batches:
+                    simulator.agent_update(batch)
+                agent_states[it] = (simulator.agent.state_dict(), simulator.optimizer.state_dict())
+
+            # collect the simulation results
+            reward, step, state = simulator.simulate(TRIAL, seed=seeds)
+            rewards.append(reward)
+            steps.append(step)
+            states += state
         
-        if _sgn is not None:
-            simulator.sgn.load_state_dict(_sgn)
-
-        if len(_batch) > 0:
-            for ob in _batch:
-                simulator.agent_update(ob)
-
-        rewards, steps, states = simulator.simulate(SAMPLES, seed=_seeds)
-        agent_states = [simulator.agent.state_dict(), simulator.optimizer.state_dict()]
         data = (rewards, steps, states, agent_states)
-        
         comm.send(data, dest=0)
 
 
 def master():
     print('I am the master.')
-
     seeder = Seeder(SEED)
-    memory = buffer.StateBuffer(MAX_BUFFER)
+    memory = StateBuffer(MAX_BUFFER)
 
-    msg_agents = [None for _ in range(WORKERS)]
-    msg_sgns   = [None for _ in range(WORKERS)]
+    msg_agents = []
+    for _ in range(BESTS):   # randomly initialize some agents.
+        msg_agents.append((simulator.agent.state_dict(), simulator.optimizer.state_dict()))
+        simulator.agent.reset()
+
+    msg_sgns   = [None for _ in range(WORKERS)]  # synthetic gradients
     msg_batch  = []
-    msg_seeds  = seeder.next_batch(SAMPLES)
+    msg_seeds  = seeder.next_batch(TRIAL)
     
-    for epoch in range(10):
+    for epoch in range(200):
         t_start = time.time()
         for i in range(WORKERS):
-            msg_message = (msg_agents[i], msg_sgns[i], msg_batch, msg_seeds)
+            msg_batch = [] if i == (WORKERS - 1) else msg_batch   # leave the last batch not training.
+            msg_message = (msg_agents, msg_sgns[i], msg_batch, msg_seeds)
             comm.send(msg_message, dest=i+1)
-
-        msg_agents, msg_reward = [], []
+        
+        msg_agents, msg_reward, msg_steps = [], [], []
         for i in range(WORKERS):
-            rewards, steps, states, agent_states = comm.recv(source=i+1)
-            msg_agents.append(agent_states)
-            
+            rewards, steps, observations, agent_states = comm.recv(source=i+1)
             if (epoch == 0) and (i > 0):
-                continue      
-
-            memory.add(states)
-            msg_reward.append(np.mean(rewards))
-
-    
-        if epoch > 0:
-            t = time.time()
-            msg_agents = evolve(msg_agents, msg_sgns, msg_reward, sigma=0.1, k=4)
+                continue    
             
-        msg_batch = [memory.sample(BATCH_SIZE) for _ in range(INNER_STEP)]
-        msg_seeds = seeder.next_batch(SAMPLES)
-        msg_sgns  = mutate(simulator.sgn.state_dict(), WORKERS, sigma=0.1)
+            msg_agents += agent_states
+            msg_reward += rewards   
+            msg_steps  += steps  
+            memory.add(observations)
 
-        logger.info('time cost: {} s'.format(time.time() - t_start))
+        if epoch > 0:
+            msg_agents = evolve(msg_agents, msg_sgns, msg_reward, sigma=0.1)
+        else:
+            logger.info('initial reward: {} '.format(msg_reward))
+
+        msg_batch = [memory.sample(BATCH_SIZE) for _ in range(INNER_STEP)]
+        msg_seeds = seeder.next_batch(TRIAL)
+        msg_sgns  = mutate(simulator.sgn.state_dict(), WORKERS-1, sigma=0.1) + [None]
+        logger.info('time cost: {:.3f} s／ average / {} steps'.format(time.time() - t_start, np.mean(msg_steps)))
 
 
 def main():
@@ -436,5 +461,5 @@ def mpi_fork(n):
         return "child"
 
 if __name__ == "__main__":
-    if "parent" == mpi_fork(WORKERS+1): sys.exit()
+    if "parent" == mpi_fork(WORKERS+1): sys.exit()  
     main()
