@@ -318,12 +318,12 @@ class EvoGrad(object):
         self.population = WORKERS - 1
         self.batch_size = self.population // 2   # use antithetic sampling
         
-    def rms_stdev(self):
+    def sigma_shift(self):
         sigma, size = 0, 0
         for name in self.sigma:
-            sigma += torch.abs(self.sigma[name]).sum()
-            size += torch.numel(self.sigma[name])
-        rms = sigma / size
+            sigma += self.sigma[name].sum()
+            size  += torch.numel(self.sigma[name])
+        rms = sigma / size - self.sigma_init
         return rms
 
     def mutate(self):
@@ -369,7 +369,7 @@ class EvoGrad(object):
         new_agent_states = [agent_states[idx] for idx in bestidx]
         infostr = '{} agents: Average Rewards: {:.3f}, Min: {:.3f}, Max: {}'.format(rewards.size, np.mean(rewards), 
             np.min(rewards), ' '.join(['{:.3f}({})'.format(a, bestidx[it]) for it, a in enumerate(rewards[bestidx])]))
-        infostr += ' rms: {:.4f}'.format(self.rms_stdev())
+        infostr += ' rms: {:.6f}'.format(self.sigma_shift())
         logger.info(infostr)
 
         # Reward reshaping
@@ -393,6 +393,7 @@ class EvoGrad(object):
             change_sigma = self.sigma_alpha * delta_sigma
             change_sigma = torch.max(-self.sigma_max_change * self.sigma[name], change_sigma)
             change_sigma = torch.min( self.sigma_max_change * self.sigma[name], change_sigma)
+    
             self.sigma[name] += change_sigma
         self.simulator.optim_sgn.step()
 
