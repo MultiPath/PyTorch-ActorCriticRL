@@ -497,8 +497,8 @@ def mpi_fork(n):
             OMP_NUM_THREADS="1",
             IN_MPI="1"
         )
-        print( ["mpirun", "-np", str(n), sys.executable] + sys.argv)
-        subprocess.check_call(["mpirun", "-np", str(n), sys.executable] +['-u']+ sys.argv, env=env)
+        print( ["mpirun --allow-run-as-root", "-np", str(n), sys.executable] + sys.argv)
+        subprocess.check_call(["mpirun --allow-run-as-root", "-np", str(n), sys.executable] +['-u']+ sys.argv, env=env)
         return "parent"
     else:
         global nworkers, rank
