@@ -143,6 +143,14 @@ class SGN(nn.Module):
         self.saved_variables = []
         self.net = model
 
+    @staticmethod
+    def squash(s):
+        # This is equation 1 from the paper.
+        mag_sq = torch.sum(s**2, dim=-1, keepdim=True)
+        mag = torch.sqrt(mag_sq)
+        s = (mag_sq / (1.0 + mag_sq)) * (s / mag)
+        return s
+
     def forward(self, a=None, s=None, grad_y=None, mode='forward'):
         if mode == 'forward':
             y = a.mean(-1)
@@ -151,7 +159,8 @@ class SGN(nn.Module):
 
         else:
             a, s = self.saved_variables
-            syn_grad_a = self.net(a, s) / a.size(0)
+            syn_grad_a = self.net(a, s)
+            syn_grad_a = SGN.squash(syn_grad_a)
             return syn_grad_a
 
 
@@ -374,8 +383,9 @@ class EvoGrad(object):
 
         # Reward reshaping
         rewards = rewards.reshape(-1, ELITES)[:-1].mean(-1)  # (65-1) * 4
-        rewards = compute_centered_ranks(rewards)
+        # rewards = compute_centered_ranks(rewards)
         b = np.mean(rewards)
+        r =np.std(rewards)
         # rewards = (rewards - np.mean(rewards)) / (np.std(rewards) + 1e-9)  # normalized reward
         # weights = normalized_reward / (WORKERS-1) / (self.sigma * self.sigma)
 
@@ -388,7 +398,7 @@ class EvoGrad(object):
             for i in range(self.batch_size):
                 epsilon = sgn_states[i][name] - p.data
                 p.grad.data -= rT[i] * epsilon / self.batch_size  # update mu
-                delta_sigma += (rS[i] - b) * ((epsilon * epsilon - self.sigma[name] * self.sigma[name]) / self.sigma[name]) / self.batch_size
+                delta_sigma += (rS[i] - b) * ((epsilon * epsilon - self.sigma[name] * self.sigma[name]) / self.sigma[name]) / self.batch_size 
 
             change_sigma = self.sigma_alpha * delta_sigma
             change_sigma = torch.max(-self.sigma_max_change * self.sigma[name], change_sigma)
@@ -497,8 +507,8 @@ def mpi_fork(n):
             OMP_NUM_THREADS="1",
             IN_MPI="1"
         )
-        print( ["mpirun --allow-run-as-root", "-np", str(n), sys.executable] + sys.argv)
-        subprocess.check_call(["mpirun --allow-run-as-root", "-np", str(n), sys.executable] +['-u']+ sys.argv, env=env)
+        print( ["mpirun", "--allow-run-as-root", "-np", str(n), sys.executable] + sys.argv)
+        subprocess.check_call(["mpirun", "--allow-run-as-root", "-np", str(n), sys.executable] +['-u']+ sys.argv, env=env)
         return "parent"
     else:
         global nworkers, rank

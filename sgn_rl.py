@@ -94,6 +94,14 @@ class SGN(nn.Module):
         self.saved_variables = []
         self.net = model
 
+    @staticmethod
+    def squash(s):
+        # This is equation 1 from the paper.
+        mag_sq = torch.sum(s**2, dim=-1, keepdim=True)
+        mag = torch.sqrt(mag_sq)
+        s = (mag_sq / (1.0 + mag_sq)) * (s / mag)
+        return s
+
     def forward(self, a=None, s=None, grad_y=None, mode='forward'):
         if mode == 'forward':
             y = a.mean(-1)
@@ -102,7 +110,8 @@ class SGN(nn.Module):
 
         else:
             a, s = self.saved_variables
-            syn_grad_a = self.net(a, s) / a.size(0)
+            syn_grad_a = self.net(a, s)
+            syn_grad_a = SGN.squash(syn_grad_a)
             return syn_grad_a
 
 
