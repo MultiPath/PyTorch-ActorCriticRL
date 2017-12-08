@@ -47,7 +47,7 @@ MAX_BUFFER = 1000000
 MAX_TOTAL_REWARD = 300
 WORKERS = 65
 TRIAL = 4
-BESTS = 4
+ELITES = 4
 BATCH_SIZE = 128
 INNER_STEP = 5
 SEED = 206
@@ -240,7 +240,7 @@ class Simulator(object):
         self.agent = agent
         self.sgn = sgn
         self.optimizer = torch.optim.Adam(self.agent.parameters(), 0.001) 
-        self.optim_sgn = torch.optim.Adam(self.sgn.parameters(), 0.002) 
+        self.optim_sgn = torch.optim.Adam(self.sgn.parameters(), 0.01) 
 
         if self.gpu > -1:
             self.agent = agent.cuda(gpu)
@@ -299,64 +299,110 @@ class Simulator(object):
         steps = np.mean(steps)
         return rewards, steps, states
 
-simulator = Simulator(
-            Agent(games['bipedhard']), 
-            SGN(SGNET(games['bipedhard'])),
-            gpu=-1)
-
 
 # ------------------- EvoGrad --------------------------------------- #
-def mutate(state_dict, population, sigma=0.1):
-    noise_states = []
-    for _ in range(population):
-        noise_state = dict()
-        for w in state_dict:
-            noise_state[w] = torch.normal(state_dict[w], sigma)
-        noise_states.append(noise_state)
-    return noise_states
-
-
-def evolve(agent_states, sgn_states, rewards, sigma=0.1):
-    # agent_states: WORKERS x BESTS
-    # sgn_states:   WORKERS
-    # rewards:      WORKERS x [BESTS]
-    def compute_ranks(x):
-        assert x.ndim == 1
-        ranks = np.empty(x.size, dtype=int)
-        ranks[x.argsort()] = np.arange(x.size)
-        return ranks
-
-    def compute_centered_ranks(x):
-        """
-        https://github.com/openai/evolution-strategies-starter/blob/master/es_distributed/es.py
-        """
-        y = compute_ranks(x).astype(np.float32)
-        y /= (x.size - 1)
-        y -= .5
-        return y
+class EvoGrad(object):
     
-    # Agent Selection:
-    rewards = np.array(rewards, dtype=np.float32)  # BESTS x WORKERS
-    bestidx = np.argsort(rewards)[::-1][:BESTS]    # best index
-    new_agent_states = [agent_states[idx] for idx in bestidx]
-    logger.info('{} agents: Average Rewards: {:.3f}, Min: {:.3f}, Max: {}'.format(rewards.size, np.mean(rewards), 
-        np.min(rewards), ' '.join(['{:.3f}({})'.format(a, bestidx[it]) for it, a in enumerate(rewards[bestidx])])))
+    def __init__(self, simulator, 
+                sigma_init=0.1,
+                sigma_alpha=0.1):   # use PEPG for EvoGradient
+        self.sigma_init = sigma_init
+        self.sigma_alpha = sigma_alpha
+        self.sigma_max_change = 0.2
+        self.sigma_limit = 0.01
+        self.sigma_decay = 0.999
 
-    # Reward reshaping
-    rewards = rewards.reshape(-1, BESTS)[:-1].mean(-1)  # (65-1) * 4
-    ranked_rewards = compute_centered_ranks(rewards)
-    normalized_reward = (ranked_rewards - np.mean(ranked_rewards)) / np.std(ranked_rewards)
-    weights = normalized_reward / (WORKERS-1) / (sigma * sigma)
+        self.simulator = simulator
+        self.sigma = {name: p.data * 0 + sigma_init 
+                        for name, p in self.simulator.sgn.named_parameters()}
+        self.population = WORKERS - 1
+        self.batch_size = self.population // 2   # use antithetic sampling
+        
+    def rms_stdev(self):
+        sigma, size = 0, 0
+        for name in self.sigma:
+            sigma += torch.abs(self.sigma[name]).sum()
+            size += torch.numel(self.sigma[name])
+        rms = sigma / size
+        return rms
 
-    # SGN updates (ES + Adam)
-    simulator.optim_sgn.zero_grad()
-    for name, p in simulator.sgn.named_parameters():
-        for i in range(WORKERS-1):
-            p.grad.data += weights[i] * (p.data - sgn_states[i][name])
-    simulator.optim_sgn.step()
+    def mutate(self):
+        noise_states = []
+        state_dict = self.simulator.sgn.state_dict()
+        for _ in range(self.batch_size):
+            noise_state = dict()
+            for w in state_dict:
+                noise_state[w] = state_dict[w] + torch.normal(mean=0, std=self.sigma[w])
+            noise_states.append(noise_state)
+        
+        # antithetic noise
+        for i in range(self.batch_size):
+            noise_state = dict()
+            for w in state_dict:
+                noise_state[w] = -noise_states[i][w] + 2 * state_dict[w]
+            noise_states.append(noise_state) 
 
-    return new_agent_states
+        return noise_states
 
+    def evolve(self, agent_states, sgn_states, rewards):
+        # agent_states: WORKERS x ELITES
+        # sgn_states:   WORKERS
+        # rewards:      WORKERS x [ELITES]
+        def compute_ranks(x):
+            assert x.ndim == 1
+            ranks = np.empty(x.size, dtype=int)
+            ranks[x.argsort()] = np.arange(x.size)
+            return ranks
+
+        def compute_centered_ranks(x):
+            """
+            https://github.com/openai/evolution-strategies-starter/blob/master/es_distributed/es.py
+            """
+            y = compute_ranks(x).astype(np.float32)
+            y /= (x.size - 1)
+            y -= .5
+            return y
+        
+        # Agent Selection:
+        rewards = np.array(rewards, dtype=np.float32)   # ELITES x WORKERS
+        bestidx = np.argsort(rewards)[::-1][:ELITES]    # best index
+        new_agent_states = [agent_states[idx] for idx in bestidx]
+        infostr = '{} agents: Average Rewards: {:.3f}, Min: {:.3f}, Max: {}'.format(rewards.size, np.mean(rewards), 
+            np.min(rewards), ' '.join(['{:.3f}({})'.format(a, bestidx[it]) for it, a in enumerate(rewards[bestidx])]))
+        infostr += ' rms: {:.4f}'.format(self.rms_stdev())
+        logger.info(infostr)
+
+        # Reward reshaping
+        rewards = rewards.reshape(-1, ELITES)[:-1].mean(-1)  # (65-1) * 4
+        rewards = compute_centered_ranks(rewards)
+        b = np.mean(rewards)
+        # rewards = (rewards - np.mean(rewards)) / (np.std(rewards) + 1e-9)  # normalized reward
+        # weights = normalized_reward / (WORKERS-1) / (self.sigma * self.sigma)
+
+        # SGN updates (PEPG)
+        rT = (rewards[:self.batch_size] - rewards[self.batch_size:]) / 2.0 
+        rS = (rewards[:self.batch_size] + rewards[self.batch_size:]) / 2.0 
+        self.simulator.optim_sgn.zero_grad()
+        for name, p in self.simulator.sgn.named_parameters():
+            delta_sigma = torch.zeros(*self.sigma[name].size())
+            for i in range(self.batch_size):
+                epsilon = sgn_states[i][name] - p.data
+                p.grad.data -= rT[i] * epsilon / self.batch_size  # update mu
+                delta_sigma += (rS[i] - b) * ((epsilon * epsilon - self.sigma[name] * self.sigma[name]) / self.sigma[name]) / self.batch_size
+
+            change_sigma = self.sigma_alpha * delta_sigma
+            change_sigma = torch.max(-self.sigma_max_change * self.sigma[name], change_sigma)
+            change_sigma = torch.min( self.sigma_max_change * self.sigma[name], change_sigma)
+            self.sigma[name] += change_sigma
+        self.simulator.optim_sgn.step()
+
+        return new_agent_states
+
+# --------------------------------------------------------------------------------- #
+simulator = Simulator(
+            Agent(games['bipedhard']), 
+            SGN(SGNET(games['bipedhard'])), gpu=-1)
+evo = EvoGrad(simulator, sigma_init=0.1)
 
 def slave():
     # make enviromnent
@@ -395,7 +441,7 @@ def master():
     memory = StateBuffer(MAX_BUFFER)
 
     msg_agents = []
-    for _ in range(BESTS):   # randomly initialize some agents.
+    for _ in range(ELITES):   # randomly initialize some agents.
         msg_agents.append((simulator.agent.state_dict(), simulator.optimizer.state_dict()))
         simulator.agent.reset()
 
@@ -422,14 +468,14 @@ def master():
             memory.add(observations)
 
         if epoch > 0:
-            msg_agents = evolve(msg_agents, msg_sgns, msg_reward, sigma=0.1)
+            msg_agents = evo.evolve(msg_agents, msg_sgns, msg_reward)
         else:
             logger.info('initial reward: {} '.format(msg_reward))
 
         msg_batch = [memory.sample(BATCH_SIZE) for _ in range(INNER_STEP)]
         msg_seeds = seeder.next_batch(TRIAL)
-        msg_sgns  = mutate(simulator.sgn.state_dict(), WORKERS-1, sigma=0.1) + [None]
-        logger.info('time cost: {:.3f} s／ average / {} steps'.format(time.time() - t_start, np.mean(msg_steps)))
+        msg_sgns  = evo.mutate() + [None]
+        logger.info('Epoch {}, time cost: {:.3f} s／ average / {:.3f} steps'.format(epoch, time.time() - t_start, np.mean(msg_steps)))
 
 
 def main():
